@@ -17,6 +17,7 @@ from tests.test_ring_hybrid import (
     make_cu_seqlens,
     make_local_qkv,
     parse_int_list,
+    validate_metadata_args,
 )
 
 
@@ -286,6 +287,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-comp-sm", type=int, default=100)
     parser.add_argument("--num-comm-sm", type=int, default=16)
     parser.add_argument("--repeat", type=int, default=2)
+    parser.set_defaults(mode="causal")
     return parser.parse_args()
 
 
@@ -296,9 +298,8 @@ if __name__ == "__main__":
     if args.qhead % args.kvhead:
         raise SystemExit("qhead must be divisible by kvhead")
     rank, world_size = init_distributed()
-    if world_size != 8:
-        raise SystemExit("The default hybrid coverage requires 8 local ranks")
     try:
+        validate_metadata_args(args, world_size)
         run_case(args, rank, world_size)
     finally:
         if dist.is_initialized():
