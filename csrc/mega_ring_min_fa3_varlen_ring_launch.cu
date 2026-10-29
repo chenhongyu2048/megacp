@@ -1,0 +1,84 @@
+// Mega ring variant copied and trimmed from csrc/min_fa3_varlen_ring_launch.cu.
+// Changes are marked with MEGA_RING comments.
+
+#include "mega_ring_min_fa3_varlen_ring_launch.h"
+
+#include <limits>
+
+namespace min_fa3_varlen_demo {
+
+namespace {
+
+template <bool IsCausal, bool CollectStats>
+void dispatch_mega_ring_kv_heads(
+    Ring_fwd_params& params,
+    kittens::py::TKParallelTensor& remote_k,
+    kittens::py::TKParallelTensor& remote_v,
+    cudaStream_t stream) {
+    switch (params.h_k) {
+        case 1: mega_ring_detail::dispatch_mega_ring_world_size<IsCausal, 1, CollectStats>(params, remote_k, remote_v, stream); break;
+        case 2: mega_ring_detail::dispatch_mega_ring_world_size<IsCausal, 2, CollectStats>(params, remote_k, remote_v, stream); break;
+        case 4: mega_ring_detail::dispatch_mega_ring_world_size<IsCausal, 4, CollectStats>(params, remote_k, remote_v, stream); break;
+        case 8: mega_ring_detail::dispatch_mega_ring_world_size<IsCausal, 8, CollectStats>(params, remote_k, remote_v, stream); break;
+        default: TORCH_CHECK(false, "Mega ring forward requires kv_heads in {1, 2, 4, 8}. Got ", params.h_k);
+    }
+}
+
+}  // namespace
+
+void run_mega_ring_min_fa3_varlen_ring_fwd(
+    Ring_fwd_params& params,
+    kittens::py::TKParallelTensor& remote_k,
+    kittens::py::TKParallelTensor& remote_v,
+    cudaStream_t stream) {
+    TORCH_CHECK(params.num_comp_sm > 0, "Mega ring varlen kernel requires num_comp_sm > 0. Got ", params.num_comp_sm);
+    TORCH_CHECK(params.num_comm_sm >= 0, "Mega ring varlen kernel requires num_comm_sm >= 0. Got ", params.num_comm_sm);
+    TORCH_CHECK(params.ring_world_size >= 1, "Mega ring varlen kernel requires ring_world_size >= 1. Got ", params.ring_world_size);
+    TORCH_CHECK(params.num_comp_sm + params.num_comm_sm <= std::numeric_limits<int>::max(),
+                "Mega ring varlen kernel total block count must fit in int32");
+    TORCH_CHECK(remote_k.local_world_size_ == remote_v.local_world_size_, "remote_k and remote_v must share the same local_world_size");
+    TORCH_CHECK(remote_k.local_rank_ == remote_v.local_rank_, "remote_k and remote_v must share the same local_rank");
+    TORCH_CHECK(remote_k.local_world_size_ == params.ring_world_size,
+                "remote_k local_world_size must match ring_world_size. Got local_world_size=",
+                remote_k.local_world_size_, ", ring_world_size=", params.ring_world_size);
+    TORCH_CHECK(remote_k.local_rank_ == params.ring_rank,
+                "remote_k local_rank must match ring_rank. Got local_rank=",
+                remote_k.local_rank_, ", ring_rank=", params.ring_rank);
+    TORCH_CHECK(params.ring_world_size == 2 || params.ring_world_size == 4 || params.ring_world_size == 8,
+                "Hierarchical mega ring forward requires ring_world_size in {2, 4, 8}");
+    TORCH_CHECK(params.mega_ring_rank_kv_capacity > 0,
+                "Mega ring varlen kernel requires mega_ring_rank_kv_capacity > 0. Got ",
+                params.mega_ring_rank_kv_capacity);
+    TORCH_CHECK(params.mega_ring_ring_sizes != nullptr, "Mega ring varlen kernel requires device ring sizes");
+    if (params.is_causal) {
+        TORCH_CHECK(params.mega_ring_kv_ready_prefix != nullptr,
+                    "Causal mega ring requires KV ready prefix storage");
+        TORCH_CHECK(params.mega_ring_q_assigned != nullptr
+                        && params.mega_ring_q_merged != nullptr
+                        && params.mega_ring_q_output_state != nullptr,
+                    "Causal mega ring requires assigned, merged, and output state storage");
+    } else {
+        TORCH_CHECK(params.mega_ring_kv_ready_counts != nullptr, "Mega ring varlen kernel requires mega_ring_kv_ready_counts storage");
+        TORCH_CHECK(params.mega_ring_step_ready != nullptr, "Mega ring varlen kernel requires mega_ring_step_ready counter storage");
+    }
+    TORCH_CHECK(params.mega_ring_scan_cursor != nullptr, "Mega ring varlen kernel requires mega_ring_scan_cursor storage");
+    TORCH_CHECK(params.mega_ring_completed_tiles != nullptr, "Mega ring varlen kernel requires mega_ring_completed_tiles storage");
+    TORCH_CHECK(params.num_comm_sm > 0 || params.mega_ring_hierarchy.reduction_tiles == 0,
+                "Mega ring varlen kernel requires num_comm_sm > 0 when replay work is present");
+
+    if (params.is_causal) {
+        if (params.mega_ring_stats != nullptr) {
+            dispatch_mega_ring_kv_heads<true, true>(params, remote_k, remote_v, stream);
+        } else {
+            dispatch_mega_ring_kv_heads<true, false>(params, remote_k, remote_v, stream);
+        }
+    } else {
+        if (params.mega_ring_stats != nullptr) {
+            dispatch_mega_ring_kv_heads<false, true>(params, remote_k, remote_v, stream);
+        } else {
+            dispatch_mega_ring_kv_heads<false, false>(params, remote_k, remote_v, stream);
+        }
+    }
+}
+
+}  // namespace min_fa3_varlen_demo

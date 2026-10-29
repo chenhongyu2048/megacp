@@ -1,0 +1,59 @@
+*.ncu-rep
+*.sass
+*.ptx
+*.cubin
+*.plk
+.DS_Store
+.vscode
+worktrees/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+
+# C extensions
+*.so
+
+# Distribution / packaging
+bin/
+build/
+develop-eggs/
+dist/
+eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+.eggs/
+
+# IDE-related
+.idea/
+.vscode/
+
+# Dev
+venv
+agent_space/
+benchmarks/results/
+.venv/
+.codex/
+.agents/
+.claude/
+.cache/
+
+# Nsight / profiler reports may contain env vars or secrets
+*.nsys-rep
+*.sqlite
+
+# compile-time generated file
+flash_attn_config.py
+
+# Generated measurements and figures
+benchmark_logs/
+performance/
+problem_record/
+*.out
+dataset/*.png

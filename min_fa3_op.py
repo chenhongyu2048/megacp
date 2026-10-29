@@ -1,0 +1,507 @@
+"""Hopper FlashAttention backend for Mega-CP forward and backward attention."""
+
+import os
+from typing import Optional, Tuple, Union
+
+import torch
+import torch.distributed as dist
+
+from _min_fa3_op import (
+    _BackwardVarlenMegaRingWorkspace,
+    _create_backward_varlen_mega_ring_workspace as _create_backward_varlen_mega_ring_workspace_cuda,
+    _dcp_mega_varlen_barrier,
+    TKParallelTensor,
+    backward as _backward_cuda,
+    backward_varlen as _backward_varlen_cuda,
+    backward_varlen_mega_ring as _backward_varlen_mega_ring_cuda,
+    parallel_remote_load_out as _parallel_remote_load_out_cuda,
+    parallel_remote_load_vec_out as _parallel_remote_load_vec_out_cuda,
+    forward,
+    forward_kvcache,
+    forward_chunk_prefill_varlen_dcp_mega,
+    forward_kvcache_varlen as _forward_kvcache_varlen_cuda,
+    forward_varlen as _forward_varlen_cuda,
+    forward_varlen_mega_ring as _forward_varlen_mega_ring_cuda,
+    forward_varlen_mega_ring_ablation as _forward_varlen_mega_ring_ablation_cuda,
+    _prepare_mega_ring_causal_comm_windows,
+    _prepare_mega_ring_forward_workspace,
+    _prepare_mega_ring_forward_call_workspace,
+    forward_varlen_ring as _forward_varlen_ring_cuda,
+    parallel_remote_load as _parallel_remote_load_cuda,
+    parallel_remote_load_vec as _parallel_remote_load_vec_cuda,
+)
+
+
+def backward(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    is_causal: bool,
+    *,
+    deterministic: bool = False,
+    dq: Optional[torch.Tensor] = None,
+    dk: Optional[torch.Tensor] = None,
+    dv: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _backward_cuda(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        bool(is_causal),
+        deterministic=bool(deterministic),
+        dq=dq,
+        dk=dk,
+        dv=dv,
+    )
+
+
+def backward_varlen(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    is_causal: bool,
+    *,
+    deterministic: bool = False,
+    dq: Optional[torch.Tensor] = None,
+    dk: Optional[torch.Tensor] = None,
+    dv: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _backward_varlen_cuda(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        int(max_seqlen_q),
+        int(max_seqlen_k),
+        bool(is_causal),
+        deterministic=bool(deterministic),
+        dq=dq,
+        dk=dk,
+        dv=dv,
+    )
+
+
+def backward_varlen_mega_ring(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    *,
+    cu_seqlens_q_host: torch.Tensor,
+    cu_seqlens_k_host: torch.Tensor,
+    remote_k: TKParallelTensor,
+    remote_v: TKParallelTensor,
+    remote_dk_accum: TKParallelTensor,
+    remote_dv_accum: TKParallelTensor,
+    remote_dkv_completion: TKParallelTensor,
+    num_comp_sm: int,
+    num_comm_sm: int,
+    global_seqlens_host: torch.Tensor,
+    ring_sizes_host: torch.Tensor,
+    ring_starts_host: torch.Tensor,
+    workspace: Optional[_BackwardVarlenMegaRingWorkspace] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _backward_varlen_mega_ring_cuda(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        cu_seqlens_q_host,
+        cu_seqlens_k_host,
+        int(max_seqlen_q),
+        int(max_seqlen_k),
+        remote_k,
+        remote_v,
+        remote_dk_accum,
+        remote_dv_accum,
+        remote_dkv_completion,
+        int(num_comp_sm),
+        int(num_comm_sm),
+        global_seqlens_host,
+        ring_sizes_host,
+        ring_starts_host,
+        workspace=workspace,
+    )
+
+
+def _create_backward_varlen_mega_ring_workspace(
+    q: torch.Tensor,
+    cu_seqlens_q_host: torch.Tensor,
+    cu_seqlens_k_host: torch.Tensor,
+    world_size: int,
+    kv_heads: int,
+    rank_capacity: int,
+) -> _BackwardVarlenMegaRingWorkspace:
+    """Internal preallocated workspace used by backward topology benchmarks."""
+    return _create_backward_varlen_mega_ring_workspace_cuda(
+        q,
+        cu_seqlens_q_host,
+        cu_seqlens_k_host,
+        int(world_size),
+        int(kv_heads),
+        int(rank_capacity),
+    )
+
+# Resolve the local rank metadata used by the TK parallel IPC path.
+# Args:
+#   local_rank: Optional explicit CUDA device index for the current process.
+#   local_world_size: Optional explicit number of local ranks on this node.
+def _resolve_parallel_context(
+    local_rank: Optional[int],
+    local_world_size: Optional[int],
+) -> Tuple[int, int]:
+    if local_rank is None:
+        env_local_rank = os.environ.get("LOCAL_RANK")
+        if env_local_rank is not None:
+            local_rank = int(env_local_rank)
+        else:
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA is required for parallel_remote_load")
+            local_rank = torch.cuda.current_device()
+
+    if local_world_size is None:
+        env_local_world_size = os.environ.get("LOCAL_WORLD_SIZE")
+        if env_local_world_size is not None:
+            local_world_size = int(env_local_world_size)
+        elif dist.is_available() and dist.is_initialized():
+            local_world_size = dist.get_world_size()
+        else:
+            raise RuntimeError(
+                "local_world_size is required when LOCAL_WORLD_SIZE is not set "
+                "and torch.distributed is not initialized"
+            )
+
+    if dist.is_available() and dist.is_initialized():
+        world_size = dist.get_world_size()
+        if world_size != local_world_size:
+            raise RuntimeError(
+                "ThunderKittens parallel IPC path is single-node only: "
+                f"world_size={world_size}, local_world_size={local_world_size}"
+            )
+
+    return int(local_rank), int(local_world_size)
+
+
+# Wrap a validated local CUDA tensor in the TKParallelTensor IPC container.
+# Args:
+#   tensor: Contiguous CUDA tensor owned by the current local rank.
+#   local_rank: Optional explicit CUDA device index for the current process.
+#   local_world_size: Optional explicit number of local ranks on this node.
+def create_parallel_tensor(
+    tensor: torch.Tensor,
+    *,
+    local_rank: Optional[int] = None,
+    local_world_size: Optional[int] = None,
+) -> TKParallelTensor:
+    local_rank, local_world_size = _resolve_parallel_context(local_rank, local_world_size)
+    if not tensor.is_cuda:
+        raise ValueError("tensor must be a CUDA tensor")
+    if not tensor.is_contiguous():
+        raise ValueError("tensor must be contiguous")
+    if tensor.device.index != local_rank:
+        raise ValueError(
+            f"tensor device index ({tensor.device.index}) must match local_rank ({local_rank})"
+        )
+    return TKParallelTensor(
+        tensor,
+        local_rank=local_rank,
+        local_world_size=local_world_size,
+        multicast=False,
+    )
+
+
+# Load a remote tensor from src_rank, optionally writing into a caller-provided output buffer.
+# Args:
+#   input_tensor: Source tensor as either a raw CUDA tensor or a TKParallelTensor wrapper.
+#   src_rank: Rank that owns the source tensor to be remotely loaded.
+#   output: Optional preallocated destination tensor to fill in-place.
+#   num_blocks: Optional thread-block count; defaults to the local device SM count.
+#   local_rank: Optional explicit CUDA device index for the current process.
+#   local_world_size: Optional explicit number of local ranks on this node.
+def parallel_remote_load(
+    input_tensor: Union[torch.Tensor, TKParallelTensor],
+    src_rank: int,
+    output: Optional[torch.Tensor] = None,
+    num_blocks: Optional[int] = None,
+    local_rank: Optional[int] = None,
+    local_world_size: Optional[int] = None,
+) -> torch.Tensor:
+    if isinstance(input_tensor, TKParallelTensor):
+        parallel_input = input_tensor
+    else:
+        parallel_input = create_parallel_tensor(
+            input_tensor,
+            local_rank=local_rank,
+            local_world_size=local_world_size,
+        )
+
+    if num_blocks is None:
+        num_blocks = torch.cuda.get_device_properties(parallel_input.local_rank_).multi_processor_count
+
+    if output is not None:
+        _parallel_remote_load_out_cuda(output, parallel_input, int(src_rank), int(num_blocks))
+        return output
+
+    return _parallel_remote_load_cuda(parallel_input, int(src_rank), int(num_blocks))
+
+# Load a remote tensor row-by-row with a vector TMA path, optionally writing into a caller-provided output buffer.
+# Args:
+#   input_tensor: Source tensor as either a raw CUDA tensor or a TKParallelTensor wrapper.
+#   src_rank: Rank that owns the source tensor to be remotely loaded.
+#   output: Optional preallocated destination tensor to fill in-place.
+#   num_blocks: Optional thread-block count; defaults to the local device SM count.
+#   local_rank: Optional explicit CUDA device index for the current process.
+#   local_world_size: Optional explicit number of local ranks on this node.
+def parallel_remote_load_vec(
+    input_tensor: Union[torch.Tensor, TKParallelTensor],
+    src_rank: int,
+    output: Optional[torch.Tensor] = None,
+    num_blocks: Optional[int] = None,
+    local_rank: Optional[int] = None,
+    local_world_size: Optional[int] = None,
+) -> torch.Tensor:
+    if isinstance(input_tensor, TKParallelTensor):
+        parallel_input = input_tensor
+    else:
+        parallel_input = create_parallel_tensor(
+            input_tensor,
+            local_rank=local_rank,
+            local_world_size=local_world_size,
+        )
+
+    if num_blocks is None:
+        num_blocks = torch.cuda.get_device_properties(parallel_input.local_rank_).multi_processor_count
+
+    if output is not None:
+        _parallel_remote_load_vec_out_cuda(output, parallel_input, int(src_rank), int(num_blocks))
+        return output
+
+    return _parallel_remote_load_vec_cuda(parallel_input, int(src_rank), int(num_blocks))
+
+
+def forward_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    is_causal: bool,
+    *,
+    cu_seqlens_q_host: torch.Tensor,
+    cu_seqlens_k_host: torch.Tensor,
+    manual_block_count: Optional[int] = None,
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    return _forward_varlen_cuda(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        cu_seqlens_q_host,
+        cu_seqlens_k_host,
+        int(max_seqlen_q),
+        int(max_seqlen_k),
+        bool(is_causal),
+        manual_block_count=manual_block_count,
+        return_lse=bool(return_lse),
+    )
+
+
+def forward_kvcache_varlen(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    *,
+    cu_seqlens_q_host: torch.Tensor,
+    cu_seqlens_k_host: torch.Tensor,
+    num_splits: int = 0,
+    return_lse: bool = False,
+    is_causal: Optional[bool] = None,
+    graph_capacity: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Run packed KV attention; ``graph_capacity`` uses fixed capacity bounds.
+
+    In capacity mode the caller validates actual lengths before replay. Device
+    offsets may include empty padding rows and change without recapturing;
+    tensor addresses, shapes, and maximum sequence-length bounds stay fixed.
+    """
+    return _forward_kvcache_varlen_cuda(
+        q,
+        k_cache,
+        v_cache,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        int(max_seqlen_q),
+        int(max_seqlen_k),
+        cu_seqlens_q_host=cu_seqlens_q_host,
+        cu_seqlens_k_host=cu_seqlens_k_host,
+        num_splits=int(num_splits),
+        return_lse=bool(return_lse),
+        is_causal=None if is_causal is None else bool(is_causal),
+        graph_capacity=bool(graph_capacity),
+    )
+
+
+def forward_varlen_ring(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    is_causal: bool,
+    *,
+    cu_seqlens_q_host: torch.Tensor,
+    cu_seqlens_k_host: torch.Tensor,
+    remote_k: TKParallelTensor,
+    remote_v: TKParallelTensor,
+    src_rank: int,
+    num_comp_sm: int,
+    num_comm_sm: int,
+    ring_step: int,
+    prefetch_k: Union[torch.Tensor, TKParallelTensor],
+    prefetch_v: Union[torch.Tensor, TKParallelTensor],
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    prefetch_k_tensor = prefetch_k.data_ if isinstance(prefetch_k, TKParallelTensor) else prefetch_k
+    prefetch_v_tensor = prefetch_v.data_ if isinstance(prefetch_v, TKParallelTensor) else prefetch_v
+
+    return _forward_varlen_ring_cuda(
+        q,
+        k,
+        v,
+        remote_k,
+        remote_v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        cu_seqlens_q_host,
+        cu_seqlens_k_host,
+        int(max_seqlen_q),
+        int(max_seqlen_k),
+        bool(is_causal),
+        int(src_rank),
+        int(num_comp_sm),
+        int(num_comm_sm),
+        int(ring_step),
+        prefetch_k_tensor,
+        prefetch_v_tensor,
+        out,
+        lse,
+        bool(return_lse),
+    )
+
+
+def forward_varlen_mega_ring(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    is_causal: bool,
+    *,
+    cu_seqlens_q_host: torch.Tensor,
+    cu_seqlens_k_host: torch.Tensor,
+    remote_k: TKParallelTensor,
+    remote_v: TKParallelTensor,
+    num_comp_sm: int,
+    num_comm_sm: int,
+    global_seqlens_host: torch.Tensor,
+    ring_sizes_host: torch.Tensor,
+    ring_starts_host: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+    stats: Optional[torch.Tensor] = None,
+    interleave_comm_windows: bool = True,
+    workspace=None,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    # K/V are rank-major [world_size * rank_kv_capacity, KVH, 128] IPC arenas.
+    # A prepared workspace binds device, shapes, topology, rank and causal mode.
+    # Reuse it serially; its window ordering takes precedence over the flag below.
+    return _forward_varlen_mega_ring_cuda(
+        q,
+        k,
+        v,
+        remote_k,
+        remote_v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        cu_seqlens_q_host,
+        cu_seqlens_k_host,
+        int(max_seqlen_q),
+        int(max_seqlen_k),
+        bool(is_causal),
+        int(num_comp_sm),
+        int(num_comm_sm),
+        global_seqlens_host,
+        ring_sizes_host,
+        ring_starts_host,
+        out,
+        lse,
+        bool(return_lse),
+        stats,
+        bool(interleave_comm_windows),
+        workspace,
+    )
+
+
+def _forward_varlen_mega_ring_ablation(*args, **kwargs):
+    """Internal preallocated runner used by ring_test.forward_ablation."""
+    return _forward_varlen_mega_ring_ablation_cuda(*args, **kwargs)
+
+
+__all__ = [
+    "TKParallelTensor",
+    "backward",
+    "backward_varlen",
+    "backward_varlen_mega_ring",
+    "create_parallel_tensor",
+    "forward_chunk_prefill_varlen_dcp_mega",
+    "forward",
+    "forward_kvcache",
+    "forward_kvcache_varlen",
+    "forward_varlen",
+    "forward_varlen_mega_ring",
+    "forward_varlen_ring",
+    "parallel_remote_load",
+    "parallel_remote_load_vec",
+]

@@ -1,0 +1,466 @@
+// Copied and trimmed from Hopper forward sources:
+// - hopper/flash_fwd_launch_template.h
+// Ring-attention-specific wrapper around the minimal SM90 varlen forward path.
+
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <type_traits>
+
+#include <torch/extension.h>
+
+#include "kittens.cuh"
+#include "pyutils/torchutils.cuh"
+
+// We include ThunderKittens torchutils only for parallel_tensor_to_pgl(...).
+// That header also defines CHECK_CUDA / CHECK_CONTIGUOUS / CHECK_INPUT as
+// tensor-property assertions, which collides with the FA3-side CHECK_CUDA(call)
+// runtime error-checking macros pulled in via min_fa3_varlen_launch.h.
+// Undefine the TK versions here so the rest of this launch path keeps using the
+// local Hopper-compatible cuda_check.h macro semantics.
+#ifdef CHECK_CUDA
+#undef CHECK_CUDA
+#endif
+#ifdef CHECK_CONTIGUOUS
+#undef CHECK_CONTIGUOUS
+#endif
+#ifdef CHECK_INPUT
+#undef CHECK_INPUT
+#endif
+
+#include "min_fa3_varlen_launch.h"
+
+namespace min_fa3_varlen_demo {
+
+using namespace cute;
+
+namespace ring_detail {
+
+using namespace kittens;
+
+template <bool IsCausal, int NumDevices>
+struct RingKernelConfig {
+    using Config = FwdConfig<IsCausal>;
+    using ArchTag = cutlass::arch::Sm90;
+    using TileShape_MNK = Shape<Int<Config::kBlockM>, Int<Config::kBlockN>, Int<kHeadDim>>;
+    using TileShape_MNK_PV = Shape<Int<Config::kBlockM>, Int<kHeadDimV>, Int<Config::kBlockN>>;
+    using ClusterShape = Shape<Int<kClusterM>, _1, _1>;
+    using CollectiveMainloop = flash::CollectiveMainloopFwdSm90<
+        kStages,
+        ClusterShape,
+        TileShape_MNK,
+        kHeadDimV,
+        Element,
+        float,
+        ArchTag,
+        IsCausal,
+        kIsLocal,
+        kHasSoftcap,
+        kVarlen,
+        kPagedKVNonTMA,
+        kAppendKV,
+        kHasQv,
+        Config::MmaPV_is_RS,
+        Config::IntraWGOverlap,
+        kPackGQA,
+        kSplit,
+        kVColMajor>;
+    using CollectiveEpilogue = flash::CollectiveEpilogueFwd<
+        TileShape_MNK_PV,
+        ClusterShape,
+        ElementOut,
+        ArchTag,
+        CollectiveMainloop::NumMmaThreads,
+        kVarlen,
+        kPackGQA,
+        kSplit,
+        false,
+        true>;
+    using Scheduler = flash::VarlenDynamicPersistentTileScheduler<
+        Config::kBlockM,
+        Config::kBlockN,
+        CollectiveMainloop::NumMmaThreads,
+        CollectiveMainloop::NumProducerThreads,
+        false,
+        false,
+        true,
+        IsCausal,
+        true,
+        true>;
+    using AttnKernel = flash::enable_sm90<flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>;
+
+    static constexpr int kVecLength = 1024;
+    static_assert(AttnKernel::MaxThreadsPerBlock % cutlass::NumThreadsPerWarp == 0);
+    static constexpr int kNumWarpsPerBlock = AttnKernel::MaxThreadsPerBlock / cutlass::NumThreadsPerWarp;
+    static constexpr int kNumCommChunks = kNumWarpsPerBlock / 2;
+    static_assert(kNumCommChunks > 0);
+    // static constexpr int kNumCommChunks = 3;
+    using shared_vec = sv_bf<kVecLength>;
+    using staging_gl = gl<bf16, 1, 1, -1, kVecLength, shared_vec>;
+    using remote_pgl = pgl<staging_gl, NumDevices, false>;
+
+    struct KernelParams {
+        typename AttnKernel::Params compute{};
+        remote_pgl remote_k;
+        remote_pgl remote_v;
+        staging_gl local_k;
+        staging_gl local_v;
+        int num_comp_sm;
+        int num_comm_sm;
+        int src_dev;
+        int rows;
+        int ring_rank;
+        int ring_world_size;
+        int ring_step;
+    };
+};
+
+template <typename RingConfig>
+constexpr void check_ring_kernel_param_layout() {
+    static_assert(alignof(CUtensorMap) >= 64);
+    static_assert(alignof(typename RingConfig::AttnKernel::Params) >= 64);
+    static_assert(alignof(typename RingConfig::remote_pgl) >= 64);
+    static_assert(alignof(typename RingConfig::staging_gl) >= 64);
+    static_assert(alignof(typename RingConfig::KernelParams) >= 64);
+
+    static_assert(offsetof(typename RingConfig::KernelParams, compute) % 64 == 0);
+    static_assert(offsetof(typename RingConfig::KernelParams, remote_k) % 64 == 0);
+    static_assert(offsetof(typename RingConfig::KernelParams, remote_v) % 64 == 0);
+    static_assert(offsetof(typename RingConfig::KernelParams, local_k) % 64 == 0);
+    static_assert(offsetof(typename RingConfig::KernelParams, local_v) % 64 == 0);
+}
+
+template <typename RingConfig>
+struct alignas(128) RingRemoteLoadBarriers {
+    semaphore arrived[RingConfig::kNumCommChunks];
+    semaphore finished[RingConfig::kNumCommChunks];
+};
+
+template <typename RingConfig>
+CUTLASS_DEVICE
+void run_ring_remote_load(
+    const typename RingConfig::KernelParams& params,
+    int comm_bid,
+    char* smem_buf) {
+    if (comm_bid >= params.num_comm_sm) {
+        return;
+    }
+
+    tma_swizzle_allocator allocator(reinterpret_cast<int*>(smem_buf));
+    typename RingConfig::shared_vec (&vec)[RingConfig::kNumCommChunks] =
+        allocator.allocate<typename RingConfig::shared_vec, RingConfig::kNumCommChunks>();
+    __shared__ RingRemoteLoadBarriers<RingConfig> barriers;
+
+    static_assert(sizeof(RingRemoteLoadBarriers<RingConfig>) % 128 == 0);
+
+    if (threadIdx.x == 0) {
+        #pragma unroll
+        for (int i = 0; i < RingConfig::kNumCommChunks; ++i) {
+            init_semaphore(barriers.arrived[i], 0, 1);
+            init_semaphore(barriers.finished[i], 0, 1);
+        }
+    }
+    __syncthreads();
+
+    const int total_tasks = params.rows * 2;
+    const int warp_id = warp::groupid();
+    uint32_t phasebits = 0xFFFF0000;
+
+    if (warp_id < RingConfig::kNumCommChunks && laneid() == 0) {
+        const int chunk_id = warp_id;
+        for (int task_id = RingConfig::kNumCommChunks * comm_bid + chunk_id;
+             task_id < total_tasks;
+             task_id += RingConfig::kNumCommChunks * params.num_comm_sm) {
+            const bool is_v = task_id >= params.rows;
+            const int row_idx = is_v ? task_id - params.rows : task_id;
+
+            wait(barriers.finished[chunk_id], get_phasebit<1>(phasebits, 0));
+            update_phasebit<1>(phasebits, 0);
+
+            tma::expect_bytes(barriers.arrived[chunk_id], sizeof(typename RingConfig::shared_vec));
+            if (!is_v) {
+                tma::load_async(vec[chunk_id], params.remote_k[params.src_dev], {row_idx, 0}, barriers.arrived[chunk_id]);
+            } else {
+                tma::load_async(vec[chunk_id], params.remote_v[params.src_dev], {row_idx, 0}, barriers.arrived[chunk_id]);
+            }
+        }
+    } else if (warp_id < 2 * RingConfig::kNumCommChunks && laneid() == 0) {
+        const int chunk_id = warp_id - RingConfig::kNumCommChunks;
+        for (int task_id = RingConfig::kNumCommChunks * comm_bid + chunk_id;
+             task_id < total_tasks;
+             task_id += RingConfig::kNumCommChunks * params.num_comm_sm) {
+            const bool is_v = task_id >= params.rows;
+            const int row_idx = is_v ? task_id - params.rows : task_id;
+
+            wait(barriers.arrived[chunk_id], get_phasebit<0>(phasebits, 0));
+            update_phasebit<0>(phasebits, 0);
+
+            if (!is_v) {
+                tma::store_async(params.local_k, vec[chunk_id], {row_idx, 0});
+            } else {
+                tma::store_async(params.local_v, vec[chunk_id], {row_idx, 0});
+            }
+            tma::store_async_read_wait();
+            arrive(barriers.finished[chunk_id]);
+        }
+    }
+}
+
+template <typename RingConfig>
+CUTLASS_GLOBAL
+#ifdef __CUDACC__
+__launch_bounds__(
+    RingConfig::AttnKernel::MaxThreadsPerBlock,
+    RingConfig::AttnKernel::MinBlocksPerMultiprocessor)
+#endif
+void ring_flash_attn_varlen_kernel(CUTLASS_GRID_CONSTANT typename RingConfig::KernelParams const params) {
+    extern __shared__ char smem_buf[];
+
+    if (int(blockIdx.x) >= params.num_comp_sm) {
+        run_ring_remote_load<RingConfig>(params, int(blockIdx.x) - params.num_comp_sm, smem_buf);
+    } else {
+        typename RingConfig::AttnKernel attn_kernel;
+        attn_kernel(params.compute, smem_buf);
+    }
+}
+
+template <bool IsCausal, int NumDevices>
+void run_min_fa3_varlen_ring_sm90(
+    Ring_fwd_params& params,
+    kittens::py::TKParallelTensor& remote_k,
+    kittens::py::TKParallelTensor& remote_v,
+    cudaStream_t stream) {
+    using RingConfig = RingKernelConfig<IsCausal, NumDevices>;
+    using AttnKernel = typename RingConfig::AttnKernel;
+    check_ring_kernel_param_layout<RingConfig>();
+
+    int const seqlen_q = params.total_q;
+    int const batch_q = 1;
+    int const batch_k = 1;
+    int const remote_rows = params.total_k;
+    using Index = typename Flash_fwd_params::index_t;
+
+    TORCH_CHECK(params.h_k * params.d == RingConfig::kVecLength,
+                "Ring varlen communication path currently requires kv_heads * head_dim == ", RingConfig::kVecLength,
+                ". Got kv_heads=", params.h_k,", head_dim=", params.d);
+
+    typename RingConfig::CollectiveMainloop::StrideV v_strides = make_stride(
+        params.v_row_stride, _1{}, params.v_head_stride, Index{0});
+    typename RingConfig::CollectiveMainloop::Arguments mainloop_args{
+        static_cast<Element const*>(params.q_ptr),
+        {seqlen_q, params.d, params.h, batch_q},
+        {params.q_row_stride, _1{}, params.q_head_stride, Index{0}},
+        static_cast<Element*>(params.k_ptr),
+        {params.total_k, params.d, params.h_k, batch_k},
+        {params.k_row_stride, _1{}, params.k_head_stride, Index{0}},
+        static_cast<Element*>(params.v_ptr),
+        params.dv,
+        v_strides,
+        static_cast<Element const*>(nullptr),
+        {0, params.d, params.h_k, 0},
+        {Index{0}, _1{}, Index{0}, Index{0}},
+        static_cast<Element const*>(nullptr),
+        {Index{0}, _1{}, Index{0}, Index{0}},
+        static_cast<Element const*>(nullptr),
+        {Index{0}, _1{}, Index{0}, Index{0}},
+        static_cast<Element const*>(nullptr),
+        {0, 0},
+        {Index{0}, _1{}},
+        static_cast<Element const*>(nullptr),
+        {Index{0}, _1{}},
+        false,
+        static_cast<int const*>(nullptr),
+        {0, 0},
+        {Index{0}, _1{}},
+        params.scale_softmax,
+        nullptr, nullptr, nullptr,
+        {Index{0}, Index{0}},
+        {Index{0}, Index{0}},
+        {Index{0}, Index{0}},
+        params.window_size_left,
+        params.window_size_right,
+        params.attention_chunk,
+        0.0f,
+        params.num_splits,
+        nullptr,
+        params.cu_seqlens_q,
+        params.cu_seqlens_k,
+        nullptr,
+        params.seqused_q,
+        params.seqused_k,
+        params.leftpad_k,
+        nullptr};
+
+    typename RingConfig::CollectiveEpilogue::Arguments epilogue_args{
+        static_cast<ElementOut*>(params.o_ptr),
+        {seqlen_q, params.dv, params.h, batch_q, 1},
+        {params.o_row_stride, _1{}, params.o_head_stride, Index{0}, Index{0}},
+        static_cast<float*>(nullptr),
+        {Index{0}, _1{}, Index{0}, Index{0}, Index{0}},
+        static_cast<float*>(params.softmax_lse_ptr),
+        {_1{}, seqlen_q, Index{0}, Index{0}},
+        static_cast<float*>(nullptr),
+        {_1{}, Index{0}, Index{0}, Index{0}},
+        params.h_k,
+        params.cu_seqlens_q,
+        params.seqused_q};
+
+    int num_blocks_m = cutlass::ceil_div(params.seqlen_q, RingConfig::Config::kBlockM);
+    typename flash::TileSchedulerArguments scheduler_args{
+        num_blocks_m,
+        params.h,
+        params.b,
+        params.num_splits,
+        params.h / params.h_k,
+        params.seqlen_q,
+        params.seqlen_k,
+        params.d,
+        params.dv,
+        int(sizeof(Element)),
+        params.tile_count_semaphore,
+        params.cu_seqlens_q,
+        params.seqused_q,
+        params.num_splits_dynamic_ptr,
+        params.num_m_blocks_ptr,
+        params.varlen_batch_idx_ptr,
+        params.num_nheads_in_l2_ptr,
+        params.num_comp_sm,
+        0,
+        true};
+
+    if (!params.skip_scheduler_metadata_computation) {
+        prepare_varlen_num_blocks(
+            params,
+            stream,
+            kPackGQA,
+            RingConfig::Config::kBlockM,
+            RingConfig::Config::kBlockN,
+            params.prepare_varlen_pdl);
+        CHECK_CUDA_KERNEL_LAUNCH();
+    }
+
+    int device = 0;
+    CHECK_CUDA(cudaGetDevice(&device));
+    typename AttnKernel::Params compute_params = AttnKernel::to_underlying_arguments({
+        mainloop_args,
+        epilogue_args,
+        {device, params.num_comp_sm},
+        scheduler_args});
+
+    auto kernel = ring_flash_attn_varlen_kernel<RingConfig>;
+    dim3 grid_dims(uint32_t(params.num_comp_sm + params.num_comm_sm), 1, 1);
+    dim3 block_dims = AttnKernel::get_block_shape();
+    int smem_size = AttnKernel::SharedStorageSize;
+    // printf("launch grid=(%u,%u,%u) block=(%u,%u,%u) smem=%d bytes\n",
+    //        grid_dims.x, grid_dims.y, grid_dims.z,
+    //        block_dims.x, block_dims.y, block_dims.z,
+    //        smem_size);
+
+    if (smem_size >= 48 * 1024) {
+        CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    }
+
+    uint64_t local_k_dst = reinterpret_cast<uint64_t>(
+        params.local_k_staging_ptr != nullptr ? params.local_k_staging_ptr : params.k_ptr);
+    uint64_t local_v_dst = reinterpret_cast<uint64_t>(
+        params.local_v_staging_ptr != nullptr ? params.local_v_staging_ptr : params.v_ptr);
+
+    // pre-check mem address alignment
+    auto check_64b_alignment = [](uint64_t ptr, const char* name) {
+        TORCH_CHECK(ptr % 64 == 0, name, " must be 64-byte aligned for ring launch diagnostics");
+    };
+    check_64b_alignment(reinterpret_cast<uint64_t>(params.q_ptr), "q_ptr");
+    check_64b_alignment(reinterpret_cast<uint64_t>(params.k_ptr), "k_ptr");
+    check_64b_alignment(reinterpret_cast<uint64_t>(params.v_ptr), "v_ptr");
+    check_64b_alignment(reinterpret_cast<uint64_t>(params.o_ptr), "o_ptr");
+    check_64b_alignment(local_k_dst, "local_k_staging_ptr");
+    check_64b_alignment(local_v_dst, "local_v_staging_ptr");
+    check_64b_alignment(reinterpret_cast<uint64_t>(remote_k.data_.data_ptr()), "remote_k.data_ptr");
+    check_64b_alignment(reinterpret_cast<uint64_t>(remote_v.data_.data_ptr()), "remote_v.data_ptr");
+
+    typename RingConfig::KernelParams kernel_params{
+        compute_params,
+        kittens::py::parallel_tensor_to_pgl<typename RingConfig::remote_pgl>(remote_k, 1, 1, remote_rows, RingConfig::kVecLength),
+        kittens::py::parallel_tensor_to_pgl<typename RingConfig::remote_pgl>(remote_v, 1, 1, remote_rows, RingConfig::kVecLength),
+        kittens::make_gl<typename RingConfig::staging_gl>(local_k_dst, 1, 1, remote_rows, RingConfig::kVecLength),
+        kittens::make_gl<typename RingConfig::staging_gl>(local_v_dst, 1, 1, remote_rows, RingConfig::kVecLength),
+        params.num_comp_sm,
+        params.num_comm_sm,
+        params.src_dev,
+        remote_rows,
+        params.ring_rank,
+        params.ring_world_size,
+        params.ring_step};
+    bool const launch_with_pdl = params.prepare_varlen_pdl && !params.skip_scheduler_metadata_computation;
+    if (!launch_with_pdl) {
+        kernel<<<grid_dims, block_dims, smem_size, stream>>>(kernel_params);
+        CHECK_CUDA_KERNEL_LAUNCH();
+    } else {
+#if ((__CUDACC_VER_MAJOR__ >= 12) || ((__CUDACC_VER_MAJOR__ == 11) && (__CUDACC_VER_MINOR__ >= 8)))
+        cudaLaunchConfig_t config{};
+        cudaLaunchAttribute attrs[1]{};
+
+        config.gridDim = grid_dims;
+        config.blockDim = block_dims;
+        config.dynamicSmemBytes = smem_size;
+        config.stream = stream;
+        config.attrs = attrs;
+        config.numAttrs = 1;
+
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = 1;
+
+        CHECK_CUDA(cudaLaunchKernelEx(&config, kernel, kernel_params));
+        CHECK_CUDA_KERNEL_LAUNCH();
+#else
+        TORCH_CHECK(false, "Ring varlen PDL launch requires CUDA >= 11.8");
+#endif
+    }
+}
+
+template <bool IsCausal>
+void dispatch_ring_world_size(
+    Ring_fwd_params& params,
+    kittens::py::TKParallelTensor& remote_k,
+    kittens::py::TKParallelTensor& remote_v,
+    cudaStream_t stream) {
+    switch (remote_k.local_world_size_) {
+        case 1:
+            run_min_fa3_varlen_ring_sm90<IsCausal, 1>(params, remote_k, remote_v, stream);
+            break;
+        case 2:
+            run_min_fa3_varlen_ring_sm90<IsCausal, 2>(params, remote_k, remote_v, stream);
+            break;
+        case 3:
+            run_min_fa3_varlen_ring_sm90<IsCausal, 3>(params, remote_k, remote_v, stream);
+            break;
+        case 4:
+            run_min_fa3_varlen_ring_sm90<IsCausal, 4>(params, remote_k, remote_v, stream);
+            break;
+        case 5:
+            run_min_fa3_varlen_ring_sm90<IsCausal, 5>(params, remote_k, remote_v, stream);
+            break;
+        case 6:
+            run_min_fa3_varlen_ring_sm90<IsCausal, 6>(params, remote_k, remote_v, stream);
+            break;
+        case 7:
+            run_min_fa3_varlen_ring_sm90<IsCausal, 7>(params, remote_k, remote_v, stream);
+            break;
+        case 8:
+            run_min_fa3_varlen_ring_sm90<IsCausal, 8>(params, remote_k, remote_v, stream);
+            break;
+        default:
+            TORCH_CHECK(false, "Unsupported local_world_size for ring varlen path: ", remote_k.local_world_size_);
+    }
+}
+
+}  // namespace ring_detail
+
+void run_min_fa3_varlen_ring_fwd(
+    Ring_fwd_params& params,
+    kittens::py::TKParallelTensor& remote_k,
+    kittens::py::TKParallelTensor& remote_v,
+    cudaStream_t stream);
+
+}  // namespace min_fa3_varlen_demo

@@ -1,0 +1,143 @@
+// Copied and trimmed from Hopper backward parameter sources:
+// - hopper/flash.h
+// - hopper/flash_api.cpp
+
+#pragma once
+
+#include <cuda.h>
+#include <cstdint>
+
+#include "min_fa3_mega_ring_hierarchy.h"
+
+namespace kittens::py {
+struct TKParallelTensor;
+}
+
+namespace min_fa3_backward {
+
+struct Qkv_params {
+    using index_t = int64_t;
+
+    void* __restrict__ q_ptr;
+    void* __restrict__ k_ptr;
+    void* __restrict__ v_ptr;
+
+    index_t q_batch_stride;
+    index_t k_batch_stride;
+    index_t v_batch_stride;
+    index_t q_row_stride;
+    index_t k_row_stride;
+    index_t v_row_stride;
+    index_t q_head_stride;
+    index_t k_head_stride;
+    index_t v_head_stride;
+
+    int h, h_k;
+};
+
+struct Flash_fwd_params : public Qkv_params {
+    using index_t = int64_t;
+
+    void* __restrict__ o_ptr;
+    index_t o_batch_stride;
+    index_t o_row_stride;
+    index_t o_head_stride;
+    void* __restrict__ softmax_lse_ptr;
+
+    int b, seqlen_q, seqlen_k, d;
+    int seqlen_q_rounded, seqlen_k_rounded, d_rounded;
+    int total_q, total_k;
+    int dv, dv_rounded;
+
+    float scale_softmax;
+    int window_size_left, window_size_right;
+
+    int* __restrict__ cu_seqlens_q;
+    int* __restrict__ cu_seqlens_k;
+    int* __restrict__ seqused_q;
+    int* __restrict__ seqused_k;
+
+    bool is_bf16;
+    bool is_causal;
+    bool is_local;
+
+    int arch;
+    int num_sm;
+};
+
+struct Flash_bwd_params : public Flash_fwd_params {
+    using index_t = int64_t;
+
+    void* __restrict__ do_ptr;
+    void* __restrict__ dq_ptr;
+    void* __restrict__ dk_ptr;
+    void* __restrict__ dv_ptr;
+
+    void* __restrict__ dq_accum_ptr;
+    void* __restrict__ dk_accum_ptr;
+    void* __restrict__ dv_accum_ptr;
+
+    index_t do_batch_stride;
+    index_t do_row_stride;
+    index_t do_head_stride;
+    index_t dq_batch_stride;
+    index_t dk_batch_stride;
+    index_t dv_batch_stride;
+    index_t dq_row_stride;
+    index_t dk_row_stride;
+    index_t dv_row_stride;
+    index_t dq_head_stride;
+    index_t dk_head_stride;
+    index_t dv_head_stride;
+
+    void* __restrict__ dsoftmax_sum;
+    void* __restrict__ softmax_lse_log2_ptr;
+
+    int* __restrict__ dq_semaphore;
+    int* __restrict__ dk_semaphore;
+    int* __restrict__ dv_semaphore;
+    int* __restrict__ tile_count_semaphore;
+
+    // Optional compact (batch_idx, block_idx) maps for exact-size auxiliary
+    // kernel grids. These are only populated by the mega-ring path.
+    int const* __restrict__ q_tile_map;
+    int const* __restrict__ k_tile_map;
+    int q_tile_count;
+    int k_tile_count;
+
+    // MEGA_RING_BWD: explicit causal-zigzag persistent launch metadata.
+    int ring_rank;
+    int ring_world_size;
+    int num_comp_sm;
+    int num_comm_sm;
+    int local_total_k;
+    int rank_kv_capacity;
+    int padded_rank_capacity;
+    int64_t dkv_step_stride;
+    int* __restrict__ half_cu_seqlens;
+    int* __restrict__ ring_sizes;
+    min_fa3_varlen_demo::MegaRingHierarchyDesc mega_ring_hierarchy;
+    int* __restrict__ ring_local_ready;
+    int* __restrict__ ring_expected_ready;
+    int* __restrict__ ring_kv_ready;
+    int* __restrict__ ring_kv_expected_ready;
+    int* __restrict__ ring_dkv_comm_done;
+    int* __restrict__ ring_completion;
+    int ring_expected_completion;
+    float* __restrict__ remote_dk_accum[8];
+    float* __restrict__ remote_dv_accum[8];
+    int* __restrict__ remote_dkv_completion[8];
+
+    bool deterministic;
+};
+
+void run_min_fa3_bwd(Flash_bwd_params& params, cudaStream_t stream);
+void run_min_fa3_bwd_mega_ring(
+    Flash_bwd_params& params,
+    kittens::py::TKParallelTensor& remote_k,
+    kittens::py::TKParallelTensor& remote_v,
+    kittens::py::TKParallelTensor& remote_dk_accum,
+    kittens::py::TKParallelTensor& remote_dv_accum,
+    cudaStream_t stream);
+
+}  // namespace min_fa3_backward
